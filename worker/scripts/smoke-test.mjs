@@ -1,40 +1,13 @@
-const api = "https://vampir-koylu-rooms.aurelian-studio.workers.dev";
-const response = await fetch(`${api}/rooms`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json", Origin: "https://vampirkoylu.alperensenel.com" },
-  body: JSON.stringify({ name: "Kurucu Test" }),
-});
-if (!response.ok) throw new Error(`Oda oluşturma başarısız: ${response.status}`);
-const room = await response.json();
-
-function connect({ clientId, name, hostToken = "" }) {
-  const query = new URLSearchParams({ clientId, name });
-  if (hostToken) query.set("hostToken", hostToken);
-  const socket = new WebSocket(`${api.replace("https", "wss")}/ws/${room.code}?${query}`);
-  const messages = [];
-  socket.addEventListener("message", event => messages.push(JSON.parse(event.data)));
-  return { socket, messages };
-}
-
-const waitFor = async (client, predicate, timeout = 7000) => {
-  const started = Date.now();
-  while (Date.now() - started < timeout) {
-    const match = client.messages.find(predicate);
-    if (match) return match;
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  throw new Error("Canlı oda mesajı zaman aşımına uğradı.");
-};
-
-const host = connect({ clientId: room.clientId, name: "Kurucu Test", hostToken: room.hostToken });
-await waitFor(host, message => message.type === "state" && message.room.players.length === 1);
-const guest = connect({ clientId: crypto.randomUUID(), name: "Misafir Test" });
-await waitFor(host, message => message.type === "state" && message.room.players.length === 2);
-await waitFor(guest, message => message.type === "state" && message.room.players.length === 2);
-host.socket.send(JSON.stringify({ type: "start_game", counts: { vampire: 1, villager: 1, doctor: 0, hunter: 0, mayor: 0 } }));
-const hostGame = await waitFor(host, message => message.type === "state" && message.room.status === "roles");
-const guestGame = await waitFor(guest, message => message.type === "state" && message.room.status === "roles");
-if (!hostGame.you.role || !guestGame.you.role || hostGame.you.role === guestGame.you.role) throw new Error("Özel roller beklenen biçimde dağıtılmadı.");
-if (hostGame.room.players.some(player => "role" in player)) throw new Error("Gizli rol ortak oda durumuna sızdı.");
-console.log(JSON.stringify({ ok: true, code: room.code, players: hostGame.room.players.length, privateRoles: true }));
-host.socket.close(1000);guest.socket.close(1000);
+const api="https://vampir-koylu-rooms.aurelian-studio.workers.dev",names=["Kurucu","Ayşe","Mert","Ece","Can"];
+const response=await fetch(`${api}/rooms`,{method:"POST",headers:{"Content-Type":"application/json",Origin:"https://vampirkoylu.alperensenel.com"},body:JSON.stringify({name:names[0]})});if(!response.ok)throw new Error(`Oda oluşturulamadı: ${response.status}`);const room=await response.json();
+const clients=[],waitFor=async(client,predicate,timeout=8000)=>{const started=Date.now();while(Date.now()-started<timeout){const found=[...client.messages].reverse().find(predicate);if(found)return found;await new Promise(resolve=>setTimeout(resolve,40))}throw new Error("Canlı mesaj zaman aşımı")};
+function connect(name,index){const query=new URLSearchParams({clientId:index?crypto.randomUUID():room.clientId,name});if(!index)query.set("hostToken",room.hostToken);const socket=new WebSocket(`${api.replace("https","wss")}/ws/${room.code}?${query}`),client={socket,messages:[]};socket.addEventListener("message",event=>client.messages.push(JSON.parse(event.data)));clients.push(client);return client}
+for(let index=0;index<names.length;index++){connect(names[index],index);await waitFor(clients[0],message=>message.type==="state"&&message.room.players.length===index+1)}
+clients[0].socket.send(JSON.stringify({type:"start_game",counts:{vampire:1,villager:1,doctor:1,hunter:1,mayor:1}}));
+for(const client of clients)await waitFor(client,message=>message.type==="state"&&message.room.status==="game");
+const roles=clients.map(client=>[...client.messages].reverse().find(message=>message.you?.role)?.you.role);if(new Set(roles).size!==5)throw new Error("Roller özel ve benzersiz dağıtılmadı");
+if(clients[0].messages.at(-1).room.players.some(player=>"role" in player))throw new Error("Rol ortak duruma sızdı");
+for(const phase of ["night_vampire","night_doctor","night_hunter"]){for(const client of clients){const state=await waitFor(client,message=>message.room?.phase===phase);if(state.you.canAct){const target=state.room.players.find(player=>player.alive&&player.id!==state.you.id);client.socket.send(JSON.stringify({type:"action",targetId:phase==="night_hunter"?null:target.id}))}}await waitFor(clients[0],message=>message.room?.phase!==phase&&message.room?.round===1)}
+const dawn=await waitFor(clients[0],message=>message.room?.phase==="dawn");clients[0].socket.send(JSON.stringify({type:"start_vote"}));const voters=[];for(const client of clients){const state=await waitFor(client,message=>message.room?.phase==="day_vote");if(state.you.alive)voters.push({client,state})}
+for(let index=0;index<voters.length;index++){const {client,state}=voters[index],target=state.room.players.find(player=>player.alive&&player.id!==state.you.id);client.socket.send(JSON.stringify({type:"action",targetId:target.id}));if(index===0)await waitFor(clients[1],message=>message.room?.phase==="day_vote"&&message.room.votes?.some(vote=>vote.voter&&vote.target))}
+await waitFor(clients[0],message=>message.room?.phase==="day_result"||message.room?.status==="ended");console.log(JSON.stringify({ok:true,code:room.code,players:5,privateRoles:true,nightActions:true,publicVotes:true}));clients.forEach(client=>client.socket.close(1000));

@@ -1,144 +1,27 @@
 import { DurableObject } from "cloudflare:workers";
-
-type Role = "vampire" | "villager" | "doctor" | "hunter" | "mayor";
-type Player = { id: string; name: string; connected: boolean; role?: Role };
-type RoomState = { code: string; hostId: string; hostToken: string; status: "lobby" | "roles"; players: Player[]; counts?: Record<Role, number> };
-
-const allowedOrigins = new Set(["https://vampirkoylu.alperensenel.com", "http://127.0.0.1:4173", "http://localhost:4173"]);
-const cors = (origin: string | null) => ({
-  "Access-Control-Allow-Origin": origin && allowedOrigins.has(origin) ? origin : "https://vampirkoylu.alperensenel.com",
-  "Access-Control-Allow-Methods": "POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Vary": "Origin",
-});
-const json = (data: unknown, status = 200, origin: string | null = null) => Response.json(data, { status, headers: cors(origin) });
-const cleanName = (value: unknown) => String(value ?? "").trim().slice(0, 18);
-const makeCode = () => {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const bytes = crypto.getRandomValues(new Uint8Array(6));
-  return Array.from(bytes, value => alphabet[value % alphabet.length]).join("");
-};
-const shuffle = <T>(items: T[]) => {
-  const copy = [...items];
-  for (let index = copy.length - 1; index > 0; index--) {
-    const bytes = crypto.getRandomValues(new Uint32Array(1));
-    const swapIndex = bytes[0] % (index + 1);
-    [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
-  }
-  return copy;
-};
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url), origin = request.headers.get("Origin");
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(origin) });
-    if (request.method === "GET" && url.pathname === "/health") return json({ ok: true }, 200, origin);
-    if (request.method === "POST" && url.pathname === "/rooms") {
-      const body: { name?: string } = await request.json<{ name?: string }>().catch(() => ({}));
-      const name = cleanName(body.name);
-      if (name.length < 2) return json({ error: "Geçerli bir oyuncu adı gerekli." }, 400, origin);
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const code = makeCode(), room = env.ROOMS.getByName(code), result = await room.createRoom(code, name);
-        if (result.ok) return json(result, 201, origin);
-      }
-      return json({ error: "Oda kodu üretilemedi. Tekrar dene." }, 503, origin);
-    }
-    const match = url.pathname.match(/^\/ws\/([A-Z0-9]{6})$/);
-    if (request.method === "GET" && match) return env.ROOMS.getByName(match[1]).fetch(request);
-    return json({ error: "Bulunamadı." }, 404, origin);
-  },
-} satisfies ExportedHandler<Env>;
-
-export class GameRoom extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS room_state (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL)");
-    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
-  }
-
-  private read(): RoomState | null {
-    const row = this.ctx.storage.sql.exec<{ json: string }>("SELECT json FROM room_state WHERE id = 1").toArray()[0];
-    return row ? JSON.parse(row.json) as RoomState : null;
-  }
-
-  private write(state: RoomState): void {
-    this.ctx.storage.sql.exec("INSERT INTO room_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json", JSON.stringify(state));
-  }
-
-  async createRoom(code: string, hostName: string): Promise<{ ok: boolean; code?: string; clientId?: string; hostToken?: string }> {
-    if (this.read()) return { ok: false };
-    const clientId = crypto.randomUUID(), hostToken = crypto.randomUUID();
-    this.write({ code, hostId: clientId, hostToken, status: "lobby", players: [{ id: clientId, name: hostName, connected: false }] });
-    return { ok: true, code, clientId, hostToken };
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    if (request.headers.get("Upgrade") !== "websocket") return new Response("WebSocket gerekli", { status: 426 });
-    const origin = request.headers.get("Origin");
-    if (origin && !allowedOrigins.has(origin)) return new Response("İzin verilmeyen kaynak", { status: 403 });
-    const state = this.read();
-    if (!state) return new Response("Oda bulunamadı", { status: 404 });
-    const url = new URL(request.url), clientId = url.searchParams.get("clientId") ?? "", name = cleanName(url.searchParams.get("name")), hostToken = url.searchParams.get("hostToken");
-    if (!clientId || name.length < 2) return new Response("Eksik oyuncu bilgisi", { status: 400 });
-    let player = state.players.find(item => item.id === clientId);
-    if (!player) {
-      if (state.status !== "lobby") return new Response("Oyun başladı", { status: 409 });
-      if (state.players.length >= 20) return new Response("Oda dolu", { status: 409 });
-      if (state.players.some(item => item.name.toLocaleLowerCase("tr") === name.toLocaleLowerCase("tr"))) return new Response("Bu isim kullanımda", { status: 409 });
-      player = { id: clientId, name, connected: true };
-      state.players.push(player);
-    } else {
-      if (player.id === state.hostId && hostToken !== state.hostToken) return new Response("Kurucu anahtarı geçersiz", { status: 403 });
-      player.connected = true;
-    }
-    this.write(state);
-    const pair = new WebSocketPair(), [client, server] = Object.values(pair);
-    this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ clientId });
-    this.broadcast(state);
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== "string" || message.length > 4096) return;
-    const attachment = socket.deserializeAttachment() as { clientId?: string } | null, state = this.read();
-    if (!state || !attachment?.clientId) return;
-    const sender = state.players.find(player => player.id === attachment.clientId);
-    if (!sender) return;
-    let data: { type?: string; counts?: Partial<Record<Role, number>> };
-    try { data = JSON.parse(message) as typeof data; } catch { return; }
-    if (data.type === "start_game" && sender.id === state.hostId && state.status === "lobby") {
-      const roles: Role[] = ["vampire", "villager", "doctor", "hunter", "mayor"];
-      const counts = Object.fromEntries(roles.map(role => [role, Math.max(0, Math.min(10, Math.floor(Number(data.counts?.[role] ?? 0))))])) as Record<Role, number>;
-      if (counts.vampire < 1 || Object.values(counts).reduce((sum, count) => sum + count, 0) !== state.players.length) {
-        socket.send(JSON.stringify({ type: "error", message: "Rol sayıları oyuncu sayısıyla eşleşmiyor." }));
-        return;
-      }
-      const deck = shuffle(roles.flatMap(role => Array<Role>(counts[role]).fill(role)));
-      state.players.forEach((player, index) => { player.role = deck[index]; });
-      state.counts = counts; state.status = "roles";
-      this.write(state); this.broadcast(state);
-    }
-    if (data.type === "reset" && sender.id === state.hostId) {
-      state.status = "lobby"; state.counts = undefined; state.players.forEach(player => { delete player.role; });
-      this.write(state); this.broadcast(state);
-    }
-  }
-
-  async webSocketClose(socket: WebSocket): Promise<void> {
-    const attachment = socket.deserializeAttachment() as { clientId?: string } | null, state = this.read();
-    if (!state || !attachment?.clientId) return;
-    const player = state.players.find(item => item.id === attachment.clientId);
-    if (player) { player.connected = false; this.write(state); this.broadcast(state); }
-  }
-
-  private broadcast(state: RoomState): void {
-    for (const socket of this.ctx.getWebSockets()) {
-      const attachment = socket.deserializeAttachment() as { clientId?: string } | null;
-      const you = state.players.find(player => player.id === attachment?.clientId);
-      if (!you) continue;
-      const payload = { type: "state", room: { code: state.code, status: state.status, players: state.players.map(player => ({ id: player.id, name: player.name, connected: player.connected })), counts: state.counts }, you: { id: you.id, name: you.name, role: you.role, isHost: you.id === state.hostId } };
-      try { socket.send(JSON.stringify(payload)); } catch { /* disconnected sockets are cleaned up by the runtime */ }
-    }
-  }
+type Role="vampire"|"villager"|"doctor"|"hunter"|"mayor";type Phase="night_vampire"|"night_doctor"|"night_hunter"|"dawn"|"day_vote"|"day_result";
+type Player={id:string;name:string;connected:boolean;role?:Role;alive:boolean;hunterShotUsed:boolean};
+type Room={code:string;hostId:string;hostToken:string;status:"lobby"|"game"|"ended";players:Player[];counts?:Record<Role,number>;phase?:Phase;round:number;actions:Record<string,string|null>;vampireTarget?:string|null;protectedTargets:string[];hunterTargets:string[];events:string[];winner?:"village"|"vampire"};
+type Message={type?:"start_game"|"action"|"start_vote"|"next_night"|"reset";counts?:Partial<Record<Role,number>>;targetId?:string|null};
+const origins=new Set(["https://vampirkoylu.alperensenel.com","http://127.0.0.1:4173","http://localhost:4173"]),cors=(o:string|null)=>({"Access-Control-Allow-Origin":o&&origins.has(o)?o:"https://vampirkoylu.alperensenel.com","Access-Control-Allow-Methods":"POST,OPTIONS","Access-Control-Allow-Headers":"Content-Type",Vary:"Origin"}),reply=(v:unknown,s=200,o:string|null=null)=>Response.json(v,{status:s,headers:cors(o)}),clean=(v:unknown)=>String(v??"").trim().slice(0,18);
+const code=()=>{const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789",b=crypto.getRandomValues(new Uint8Array(6));return Array.from(b,v=>a[v%a.length]).join("")},shuffle=<T>(x:T[])=>{const a=[...x];for(let i=a.length-1;i>0;i--){const j=crypto.getRandomValues(new Uint32Array(1))[0]%(i+1);[a[i],a[j]]=[a[j],a[i]]}return a};
+export default{async fetch(request:Request,env:Env){const u=new URL(request.url),o=request.headers.get("Origin");if(request.method==="OPTIONS")return new Response(null,{status:204,headers:cors(o)});if(request.method==="GET"&&u.pathname==="/health")return reply({ok:true},200,o);if(request.method==="POST"&&u.pathname==="/rooms"){const b:{name?:string}=await request.json<{name?:string}>().catch(()=>({})),n=clean(b.name);if(n.length<2)return reply({error:"Geçerli bir oyuncu adı gerekli."},400,o);for(let i=0;i<8;i++){const c=code(),r=await env.ROOMS.getByName(c).createRoom(c,n);if(r.ok)return reply(r,201,o)}return reply({error:"Oda oluşturulamadı."},503,o)}const m=u.pathname.match(/^\/ws\/([A-Z0-9]{6})$/);if(request.method==="GET"&&m)return env.ROOMS.getByName(m[1]).fetch(request);return reply({error:"Bulunamadı."},404,o)}}satisfies ExportedHandler<Env>;
+export class GameRoom extends DurableObject<Env>{
+ constructor(ctx:DurableObjectState,env:Env){super(ctx,env);this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS room_state (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL)");this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping","pong"))}
+ private read():Room|null{const r=this.ctx.storage.sql.exec<{json:string}>("SELECT json FROM room_state WHERE id=1").toArray()[0];return r?JSON.parse(r.json)as Room:null}private write(s:Room){this.ctx.storage.sql.exec("INSERT INTO room_state(id,json) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json",JSON.stringify(s))}
+ async createRoom(c:string,n:string){if(this.read())return{ok:false};const clientId=crypto.randomUUID(),hostToken=crypto.randomUUID();this.write({code:c,hostId:clientId,hostToken,status:"lobby",players:[{id:clientId,name:n,connected:false,alive:true,hunterShotUsed:false}],round:0,actions:{},protectedTargets:[],hunterTargets:[],events:[]});return{ok:true,code:c,clientId,hostToken}}
+ async fetch(request:Request){if(request.headers.get("Upgrade")!=="websocket")return new Response("WebSocket gerekli",{status:426});const o=request.headers.get("Origin");if(o&&!origins.has(o))return new Response("İzin verilmeyen kaynak",{status:403});const s=this.read();if(!s)return new Response("Oda bulunamadı",{status:404});const u=new URL(request.url),id=u.searchParams.get("clientId")??"",n=clean(u.searchParams.get("name")),token=u.searchParams.get("hostToken");if(!id||n.length<2)return new Response("Eksik bilgi",{status:400});let p=s.players.find(x=>x.id===id);if(!p){if(s.status!=="lobby")return new Response("Oyun başladı",{status:409});if(s.players.length>=20)return new Response("Oda dolu",{status:409});if(s.players.some(x=>x.name.toLocaleLowerCase("tr")===n.toLocaleLowerCase("tr")))return new Response("İsim kullanımda",{status:409});p={id,name:n,connected:true,alive:true,hunterShotUsed:false};s.players.push(p)}else{if(p.id===s.hostId&&token!==s.hostToken)return new Response("Kurucu anahtarı geçersiz",{status:403});p.connected=true}this.write(s);const pair=new WebSocketPair(),[client,server]=Object.values(pair);this.ctx.acceptWebSocket(server);server.serializeAttachment({clientId:id});this.broadcast(s);return new Response(null,{status:101,webSocket:client})}
+ async webSocketMessage(ws:WebSocket,msg:string|ArrayBuffer){if(typeof msg!=="string"||msg.length>4096)return;const a=ws.deserializeAttachment()as{clientId?:string}|null,s=this.read();if(!s||!a?.clientId)return;const p=s.players.find(x=>x.id===a.clientId);if(!p)return;let d:Message;try{d=JSON.parse(msg)as Message}catch{return}if(d.type==="start_game"&&p.id===s.hostId&&s.status==="lobby")this.start(s,d.counts,ws);else if(d.type==="action"&&s.status==="game")this.action(s,p,d.targetId??null,ws);else if(d.type==="start_vote"&&p.id===s.hostId&&s.phase==="dawn"){s.phase="day_vote";s.actions={};s.events=[];this.saveBroadcast(s)}else if(d.type==="next_night"&&p.id===s.hostId&&s.phase==="day_result"){s.round++;s.phase="night_vampire";s.actions={};s.events=[];this.skipEmpty(s);this.saveBroadcast(s)}else if(d.type==="reset"&&p.id===s.hostId){s.status="lobby";s.phase=undefined;s.counts=undefined;s.round=0;s.actions={};s.events=[];s.winner=undefined;s.players.forEach(x=>{delete x.role;x.alive=true;x.hunterShotUsed=false});this.saveBroadcast(s)}}
+ private saveBroadcast(s:Room){this.write(s);this.broadcast(s)}
+ private start(s:Room,raw:Message["counts"],ws:WebSocket){const roles:Role[]=["vampire","villager","doctor","hunter","mayor"],counts=Object.fromEntries(roles.map(r=>[r,Math.max(0,Math.min(10,Math.floor(Number(raw?.[r]??0))))]))as Record<Role,number>;if(counts.vampire<1||Object.values(counts).reduce((a,b)=>a+b,0)!==s.players.length){ws.send(JSON.stringify({type:"error",message:"Rol sayıları oyuncu sayısıyla eşleşmiyor."}));return}const deck=shuffle(roles.flatMap(r=>Array<Role>(counts[r]).fill(r)));s.players.forEach((p,i)=>{p.role=deck[i];p.alive=true;p.hunterShotUsed=false});Object.assign(s,{counts,status:"game",phase:"night_vampire",round:1,actions:{},events:[],winner:undefined});this.skipEmpty(s);this.saveBroadcast(s)}
+ private eligible(s:Room){const a=s.players.filter(p=>p.alive&&p.connected);if(s.phase==="night_vampire")return a.filter(p=>p.role==="vampire");if(s.phase==="night_doctor")return a.filter(p=>p.role==="doctor");if(s.phase==="night_hunter")return a.filter(p=>p.role==="hunter"&&!p.hunterShotUsed);if(s.phase==="day_vote")return a;return[]}
+ private action(s:Room,p:Player,targetId:string|null,ws:WebSocket){if(!this.eligible(s).some(x=>x.id===p.id))return;const target=targetId?s.players.find(x=>x.id===targetId&&x.alive):null;if(targetId&&(!target||target.id===p.id)){ws.send(JSON.stringify({type:"error",message:"Geçersiz hedef."}));return}if(s.phase!=="night_hunter"&&s.phase!=="day_vote"&&!target)return;s.actions[p.id]=target?.id??null;this.saveBroadcast(s);if(this.eligible(s).every(x=>Object.hasOwn(s.actions,x.id))){this.complete(s);this.saveBroadcast(s)}}
+ private plurality(s:Room,weighted=false){const t=new Map<string,number>();for(const[voter,target]of Object.entries(s.actions))if(target){const p=s.players.find(x=>x.id===voter),w=weighted&&p?.role==="mayor"?2:1;t.set(target,(t.get(target)??0)+w)}const r=[...t.entries()].sort((a,b)=>b[1]-a[1]);return r.length&&(r.length===1||r[0][1]>r[1][1])?r[0][0]:null}
+ private complete(s:Room){if(s.phase==="night_vampire"){s.vampireTarget=this.plurality(s);s.phase="night_doctor";s.actions={}}else if(s.phase==="night_doctor"){s.protectedTargets=Object.values(s.actions).filter((v):v is string=>Boolean(v));s.phase="night_hunter";s.actions={}}else if(s.phase==="night_hunter"){s.hunterTargets=Object.values(s.actions).filter((v):v is string=>Boolean(v));for(const id of Object.keys(s.actions)){const p=s.players.find(x=>x.id===id);if(p&&s.actions[id])p.hunterShotUsed=true}this.resolveNight(s)}else if(s.phase==="day_vote")this.resolveVote(s);this.skipEmpty(s)}
+ private skipEmpty(s:Room){let n=0;while(s.status==="game"&&["night_vampire","night_doctor","night_hunter"].includes(s.phase??"")&&this.eligible(s).length===0&&n++<4)this.complete(s)}
+ private resolveNight(s:Room){const protect=new Set(s.protectedTargets),dead=new Set<string>();if(s.vampireTarget&&!protect.has(s.vampireTarget))dead.add(s.vampireTarget);for(const id of s.hunterTargets)if(!protect.has(id))dead.add(id);for(const id of dead){const p=s.players.find(x=>x.id===id);if(p)p.alive=false}s.events=dead.size?[...dead].map(id=>`${s.players.find(p=>p.id===id)?.name} gece elendi.`):["Gece kimse elenmedi."];s.vampireTarget=null;s.protectedTargets=[];s.hunterTargets=[];s.actions={};const w=this.winner(s);if(w){s.status="ended";s.winner=w}else s.phase="dawn"}
+ private resolveVote(s:Room){const id=this.plurality(s,true),p=s.players.find(x=>x.id===id);if(p){p.alive=false;s.events=[`${p.name}, köy oylamasıyla elendi.`]}else s.events=["Oylama eşitlikle sonuçlandı; kimse elenmedi."];s.actions={};const w=this.winner(s);if(w){s.status="ended";s.winner=w}else s.phase="day_result"}
+ private winner(s:Room){const a=s.players.filter(p=>p.alive),v=a.filter(p=>p.role==="vampire").length,o=a.length-v;return v===0?"village":v>=o?"vampire":null}
+ async webSocketClose(ws:WebSocket){const a=ws.deserializeAttachment()as{clientId?:string}|null,s=this.read();if(!s||!a?.clientId)return;const p=s.players.find(x=>x.id===a.clientId);if(p){p.connected=false;if(s.status==="game"&&this.eligible(s).every(x=>Object.hasOwn(s.actions,x.id)))this.complete(s);this.saveBroadcast(s)}}
+ private broadcast(s:Room){for(const ws of this.ctx.getWebSockets()){const a=ws.deserializeAttachment()as{clientId?:string}|null,you=s.players.find(p=>p.id===a?.clientId);if(!you)continue;const votes=s.phase==="day_vote"?Object.entries(s.actions).map(([v,t])=>({voter:s.players.find(p=>p.id===v)?.name,target:t?s.players.find(p=>p.id===t)?.name:"Çekimser"})):[];const payload={type:"state",room:{code:s.code,status:s.status,phase:s.phase,round:s.round,players:s.players.map(p=>({id:p.id,name:p.name,connected:p.connected,alive:p.alive})),counts:s.counts,events:s.events,votes,winner:s.winner},you:{id:you.id,name:you.name,role:you.role,alive:you.alive,isHost:you.id===s.hostId,canAct:this.eligible(s).some(p=>p.id===you.id),hasActed:Object.hasOwn(s.actions,you.id)}};try{ws.send(JSON.stringify(payload))}catch{}}}
 }
