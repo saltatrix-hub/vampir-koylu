@@ -1,0 +1,15 @@
+{
+  "name": "vampir-koylu-room-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy --minify",
+    "test:live": "node scripts/smoke-test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest",
+    "wrangler": "latest"
+  }
+}
